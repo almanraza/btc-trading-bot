@@ -31,8 +31,12 @@ import { BPS, runBars, type BarsState, type BuyInput, type OrderInput } from './
 
 /** Bars in the mean: 5 hours of 1-minute bars. */
 const MEAN_BARS = 300;
-/** How far below the mean the close must sit to buy, in bps. */
+/** How far below the mean the close must sit to buy, in bps, at the least. */
 const ENTRY_BPS = 50n;
+/** The entry threshold also scales with recent volatility: this many times the last hour's stdev. */
+const VOL_MULT = 4n;
+/** Bars in the volatility estimate: one hour. */
+const VOL_BARS = 60;
 /** How far above the mean the close must sit to sell, in bps. */
 const EXIT_BPS = 10n;
 /** Hard stop below the entry price, in bps. */
@@ -57,6 +61,51 @@ function mean(): bigint | null {
   let sum = 0n;
   for (let i = closes.length - MEAN_BARS; i < closes.length; i++) sum += closes[i]!;
   return sum / BigInt(MEAN_BARS);
+}
+
+/**
+ * The last hour's realized volatility, in bps: the population stdev of the one-minute returns, as an
+ * integer. Null until there are VOL_BARS + 1 closes. Computed in bps so it stays exact enough to
+ * compare against a threshold without floating point.
+ */
+function volBps(): bigint | null {
+  if (closes.length < VOL_BARS + 1) return null;
+  const start = closes.length - VOL_BARS - 1;
+  // Each return in bps, scaled by 10^4 to keep integer precision through the stdev.
+  const rets: bigint[] = [];
+  for (let i = start + 1; i < closes.length; i++) {
+    const prev = closes[i - 1]!;
+    if (prev === 0n) continue;
+    rets.push(((closes[i]! - prev) * BPS * 10_000n) / prev);
+  }
+  if (rets.length < 2) return null;
+  const n = BigInt(rets.length);
+  let sum = 0n;
+  for (const r of rets) sum += r;
+  const meanRet = sum / n;
+  let sq = 0n;
+  for (const r of rets) {
+    const d = r - meanRet;
+    sq += d * d;
+  }
+  // sqrt of (sq / n) in the 10^4-scaled bps space, by Newton's method on integers.
+  const variance = sq / n;
+  if (variance <= 0n) return 0n;
+  let x = variance;
+  for (let k = 0; k < 40; k++) {
+    const next = (x + variance / x) / 2n;
+    if (next === x) break;
+    x = next;
+  }
+  return x / 10_000n;
+}
+
+/** The entry threshold in bps: ENTRY_BPS, or VOL_MULT times the last hour's volatility if larger. */
+function entryThreshold(): bigint {
+  const vol = volBps();
+  if (vol === null) return ENTRY_BPS;
+  const scaled = VOL_MULT * vol;
+  return scaled > ENTRY_BPS ? scaled : ENTRY_BPS;
 }
 
 /** True when `price` is at least `bps` below `reference`, compared exactly (no division). */
@@ -117,7 +166,7 @@ await runBars({
 
     const m = mean();
     if (m === null) return [];
-    if (!belowBy(close, m, ENTRY_BPS)) return [];
+    if (!belowBy(close, m, entryThreshold())) return [];
 
     const orders = buyOrder(state);
     if (orders.length > 0) {
